@@ -1,0 +1,39 @@
+# Environment
+.env
+.env.*
+
+# Build artifacts
+/target/
+build_*.txt
+
+# Database
+data/*.db
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Keys
+keys/
+*.pem
+
+# Temporary output files
+*_output*.txt
+result.txt
+grep_result.txt
+ls_result.txt
+server*_*.txt
+ssh_*.txt
+db_check_output.txt
+trade_analysis_full.txt
+profit_output.txt
+stats_output.txt
