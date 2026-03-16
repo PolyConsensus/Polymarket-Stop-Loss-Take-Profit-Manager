@@ -1,42 +1,30 @@
 # Polymarket Stop-Loss / Take-Profit Manager
 
-A terminal-based (TUI) position manager for [Polymarket](https://polymarket.com) that lets you set **stop-loss** and **take-profit** triggers on your open positions with automatic order execution.
-
-Also includes ML-enhanced trading bots for BTC hourly prediction markets.
+A terminal-based (TUI) position manager for [Polymarket](https://polymarket.com) that automatically monitors your open positions and executes sell orders when your **stop-loss** or **take-profit** price triggers are hit.
 
 ![Rust](https://img.shields.io/badge/Rust-000000?style=flat&logo=rust&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
 ## Features
 
-### SL/TP Position Manager (`sl_tp_bot`)
 - **Auto-scans** your wallet for all open Polymarket positions
-- **Real-time orderbook** monitoring via WebSocket for live prices
-- **Stop-Loss / Take-Profit** — set price triggers per position, auto-sells when hit
-- **Force Sell** — instantly sell any position at best bid
-- **TUI Interface** — navigate positions, set triggers, view logs in terminal
-- **SQLite persistence** — SL/TP settings survive restarts
-- **Dry-run mode** — test safely without executing real orders (default)
-
-### ML Trading Bot (`ml_bot_tui`)
-- **Z-score strategy** for BTC 1-hour up/down prediction markets
-- **Multi-exchange signals** from Binance, Kraken, Coinbase, Bybit, Bitfinex
-- **Zero-allocation hot path** — `memchr` byte parsing for Binance ticks (~50/sec)
-- **Pre-signed order caching** for low-latency execution
-- **Auto market discovery** — finds active BTC hourly markets automatically
-
-### Momentum Bot (`momentum_bot`)
-- Momentum-based strategy using price velocity and acceleration signals
+- **Real-time orderbook** monitoring via WebSocket for live mid-prices
+- **Stop-Loss** — set a floor price; auto-sells if price drops below it
+- **Take-Profit** — set a ceiling price; auto-sells if price rises above it
+- **Force Sell** — instantly sell any position at the best bid
+- **TUI Interface** — navigate positions, set triggers, and view logs in the terminal
+- **SQLite persistence** — SL/TP settings and trade history survive restarts
+- **Dry-run mode** — enabled by default, test safely without executing real orders
 
 ## Prerequisites
 
-- **Rust** (1.70+ recommended)
-- **Polymarket account** with a funded proxy wallet
-- Your **private key** and **funder (proxy) wallet address**
+- **Rust** 1.70+
+- A **Polymarket** account with a funded proxy wallet
+- Your **private key** and **funder (proxy wallet) address**
 
 ## Setup
 
-### 1. Clone the repository
+### 1. Clone
 
 ```bash
 git clone https://github.com/PolyConsensus/Polymarket-Stop-Loss-Take-Profit-Manager.git
@@ -50,30 +38,25 @@ POLYMARKET_PRIVATE_KEY=your_private_key_here
 POLYMARKET_FUNDER=your_proxy_wallet_address_here
 ```
 
-> **Never commit your `.env` file.** It's already in `.gitignore`.
+> **Never commit your `.env` file.** It is already in `.gitignore`.
 
 ### 3. Build
 
 ```bash
-cargo build --release --bin sl_tp_bot    # SL/TP Manager
-cargo build --release --bin ml_bot_tui   # ML Trading Bot
-cargo build --release --bin momentum_bot # Momentum Bot
+cargo build --release --bin sl_tp_bot
 ```
 
 ### 4. Run
 
 ```bash
-# SL/TP Manager (safe mode — no real orders)
-DRY_RUN=true ./target/release/sl_tp_bot
+# Dry-run mode (default) — no real orders
+./target/release/sl_tp_bot
 
-# ML Trading Bot (safe mode)
-DRY_RUN=true ./target/release/ml_bot_tui
-
-# Or use the start script for tmux deployment:
-./start_bot.sh
+# Live mode — real orders will be placed
+DRY_RUN=false ./target/release/sl_tp_bot
 ```
 
-## Keybindings — SL/TP Manager
+## Keybindings
 
 | Key | Action |
 |-----|--------|
@@ -88,15 +71,6 @@ DRY_RUN=true ./target/release/ml_bot_tui
 | `Enter` | Confirm input |
 | `Esc` | Cancel input |
 
-## Keybindings — ML Bot
-
-| Key | Action |
-|-----|--------|
-| `q` | Quit |
-| `d` | Toggle dry-run mode |
-| `+`/`-` | Adjust tick threshold |
-| `m` | Cycle MIN_VOLATILITY_USD (5→10→15→0) |
-
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -104,37 +78,19 @@ DRY_RUN=true ./target/release/ml_bot_tui
 | `POLYMARKET_PRIVATE_KEY` | — | Your wallet private key (also accepts `PM_PRIVATE_KEY`) |
 | `POLYMARKET_FUNDER` | — | Your proxy wallet address (also accepts `PM_FUNDER`) |
 | `DRY_RUN` | `true` | Set to `false` to enable live order execution |
-| `POSITION_SIZE` | `30` | Shares per trade (ML bot) |
-| `MIN_VOLATILITY_USD` | `5.0` | ML filter threshold |
-| `TICK_THRESHOLD` | `4` | Net ticks required for entry (ML bot) |
-| `HOLD_TIMEOUT_MS` | `7500` | Position exit timeout (ML bot) |
-| `MAX_TRADES` | `20` | Max trades per 1-hour session (ML bot) |
 
-## Architecture
+## How It Works
 
 ```
-sl_tp_bot:
-  Polymarket Data API → fetch positions → TUI display
-  Orderbook WS → real-time price updates → SL/TP trigger check → sell orders
-
-ml_bot_tui:
-  Binance WS → parse_binance_trade_fast() → IntraWindowState (Z-score)
-            → Multi-exchange signals (Kraken/Coinbase/Bybit/Bitfinex)
-            → Strategy filter → Pre-signed orders → Polymarket
+1. Connects to Polymarket Data API → fetches your open positions
+2. Subscribes to orderbook WebSocket → real-time price updates
+3. Checks each position against your SL/TP triggers every tick
+4. When triggered → sells at best bid via Polymarket CLOB API
 ```
 
-### Key Design Decisions
-- **`rust_decimal::Decimal`** for all financial math — never `f64` for money
-- **`tokio::join!`** for parallel async operations
-- **Lock discipline** — release `RwLock` before any network call
-- **SQLite** for trade history and SL/TP persistence
-
-## Database
-
-Trades and SL/TP settings are saved to SQLite (`data/sl_tp_data.db`):
-- Position details, entry prices, SL/TP levels
-- Trade execution history with timestamps
-- Auto-migrates schema on startup
+- All financial math uses `rust_decimal::Decimal` — never floating point
+- SL/TP settings are persisted in SQLite (`data/sl_tp_data.db`)
+- Positions auto-refresh every 60 seconds
 
 ## Disclaimer
 
