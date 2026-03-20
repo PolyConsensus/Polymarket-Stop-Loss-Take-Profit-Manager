@@ -170,6 +170,25 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON position_snapshots(timestamp);
         ")?;
 
+        // PolyConsensus entry snapshots — persists entry consensus data
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS consensus_entry (
+                condition_id TEXT PRIMARY KEY,
+                consensus_pct INTEGER NOT NULL DEFAULT 0,
+                yes_count INTEGER NOT NULL DEFAULT 0,
+                no_count INTEGER NOT NULL DEFAULT 0,
+                total_value REAL NOT NULL DEFAULT 0,
+                market_prob REAL NOT NULL DEFAULT 0,
+                ml_signal TEXT NOT NULL DEFAULT '',
+                ml_edge REAL NOT NULL DEFAULT 0,
+                ml_confidence TEXT NOT NULL DEFAULT '',
+                ml_risk REAL NOT NULL DEFAULT 0,
+                top_trader_count INTEGER NOT NULL DEFAULT 0,
+                active_trader_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+        ")?;
+
         eprintln!("[OK] Database initialized: {}", path);
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -284,6 +303,57 @@ impl Database {
             );
         }
         let _ = tx.commit();
+    }
+
+    /// Save consensus entry snapshot (only first time — INSERT OR IGNORE)
+    fn save_consensus_entry(&self, condition_id: &str, snap: &ConsensusSnapshot) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO consensus_entry 
+             (condition_id, consensus_pct, yes_count, no_count, total_value, market_prob,
+              ml_signal, ml_edge, ml_confidence, ml_risk, top_trader_count, active_trader_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                condition_id,
+                snap.consensus_pct,
+                snap.yes_count,
+                snap.no_count,
+                snap.total_value,
+                snap.market_prob,
+                snap.ml_signal,
+                snap.ml_edge,
+                snap.ml_confidence,
+                snap.ml_risk,
+                snap.top_trader_count,
+                snap.active_trader_count,
+            ],
+        );
+    }
+
+    /// Load consensus entry snapshot from DB
+    fn load_consensus_entry(&self, condition_id: &str) -> Option<ConsensusSnapshot> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT consensus_pct, yes_count, no_count, total_value, market_prob,
+                    ml_signal, ml_edge, ml_confidence, ml_risk, top_trader_count, active_trader_count
+             FROM consensus_entry WHERE condition_id = ?1"
+        ).ok()?;
+        stmt.query_row(params![condition_id], |row| {
+            Ok(ConsensusSnapshot {
+                consensus_pct: row.get(0)?,
+                yes_count: row.get(1)?,
+                no_count: row.get(2)?,
+                total_value: row.get(3)?,
+                market_prob: row.get(4)?,
+                ml_signal: row.get(5)?,
+                ml_edge: row.get(6)?,
+                ml_confidence: row.get(7)?,
+                ml_risk: row.get(8)?,
+                top_trader_count: row.get(9)?,
+                active_trader_count: row.get(10)?,
+                timestamp: Instant::now(),
+            })
+        }).ok()
     }
 }
 
@@ -632,6 +702,88 @@ struct OrderbookMeta {
     best_ask: Option<Decimal>,
 }
 
+/// PolyConsensus API response structures
+#[derive(Debug, Clone, Deserialize)]
+struct ConsensusApiResponse {
+    market: Option<ConsensusMarket>,
+    #[serde(rename = "mlSignal")]
+    ml_signal: Option<ConsensusMlSignal>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConsensusMarket {
+    #[serde(rename = "consensusPct", default)]
+    consensus_pct: i32,
+    #[serde(rename = "topTraderCount", default)]
+    top_trader_count: i32,
+    #[serde(rename = "activeTraderCount", default)]
+    active_trader_count: i32,
+    #[serde(rename = "totalValue", default)]
+    total_value: f64,
+    #[serde(default)]
+    outcomes: Vec<ConsensusOutcome>,
+    #[serde(rename = "topTraders", default)]
+    top_traders: Vec<ConsensusTrader>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConsensusOutcome {
+    #[allow(dead_code)]
+    name: String,
+    probability: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConsensusTrader {
+    #[serde(default)]
+    outcome: String,
+    #[serde(rename = "isArbitrage", default)]
+    is_arbitrage: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConsensusMlSignal {
+    #[serde(default)]
+    signal: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    predicted_probability: f64,
+    #[serde(default)]
+    edge: f64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    confidence_score: f64,
+    #[serde(default)]
+    confidence_label: String,
+    #[serde(default)]
+    risk_score: f64,
+}
+
+/// Snapshot of PolyConsensus data — taken at entry and updated live
+#[derive(Debug, Clone)]
+struct ConsensusSnapshot {
+    consensus_pct: i32,
+    yes_count: i32,
+    no_count: i32,
+    total_value: f64,
+    market_prob: f64,
+    ml_signal: String,
+    ml_edge: f64,
+    ml_confidence: String,
+    ml_risk: f64,
+    top_trader_count: i32,
+    active_trader_count: i32,
+    #[allow(dead_code)]
+    timestamp: Instant,
+}
+
+/// Full consensus data for a position: entry snapshot + current live data
+#[derive(Debug, Clone)]
+struct ConsensusData {
+    entry: ConsensusSnapshot,
+    current: ConsensusSnapshot,
+}
+
 /// Fetch orderbook metadata (min_order_size, tick_size, neg_risk, best bid/ask) from CLOB
 async fn fetch_orderbook_meta(token_id: &str) -> Result<OrderbookMeta> {
     let url = format!("https://clob.polymarket.com/book?token_id={}", token_id);
@@ -679,6 +831,62 @@ async fn fetch_orderbook_meta(token_id: &str) -> Result<OrderbookMeta> {
         neg_risk,
         best_bid,
         best_ask,
+    })
+}
+
+/// Fetch PolyConsensus smart market data for a condition_id
+async fn fetch_consensus_data(condition_id: &str) -> Result<ConsensusSnapshot> {
+    let url = format!("https://polyconsensus.com/api/smart-markets/{}", condition_id);
+    let resp = HTTP_CLIENT.get(&url).send().await
+        .context("Failed to fetch PolyConsensus data")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("PolyConsensus API returned {}", resp.status());
+    }
+    let api: ConsensusApiResponse = resp.json().await
+        .context("Failed to parse PolyConsensus response")?;
+
+    let market = api.market.unwrap_or(ConsensusMarket {
+        consensus_pct: 0,
+        top_trader_count: 0,
+        active_trader_count: 0,
+        total_value: 0.0,
+        outcomes: vec![],
+        top_traders: vec![],
+    });
+
+    let yes_count = market.top_traders.iter()
+        .filter(|t| t.outcome == "Yes" && !t.is_arbitrage)
+        .count() as i32;
+    let no_count = market.top_traders.iter()
+        .filter(|t| t.outcome == "No" && !t.is_arbitrage)
+        .count() as i32;
+
+    let market_prob = market.outcomes.first()
+        .map(|o| o.probability)
+        .unwrap_or(0.0);
+
+    let ml = api.ml_signal.unwrap_or(ConsensusMlSignal {
+        signal: "N/A".to_string(),
+        predicted_probability: 0.0,
+        edge: 0.0,
+        confidence_score: 0.0,
+        confidence_label: "none".to_string(),
+        risk_score: 0.0,
+    });
+
+    Ok(ConsensusSnapshot {
+        consensus_pct: market.consensus_pct,
+        yes_count,
+        no_count,
+        total_value: market.total_value,
+        market_prob,
+        ml_signal: ml.signal,
+        ml_edge: ml.edge,
+        ml_confidence: ml.confidence_label,
+        ml_risk: ml.risk_score,
+        top_trader_count: market.top_trader_count,
+        active_trader_count: market.active_trader_count,
+        timestamp: Instant::now(),
     })
 }
 
@@ -790,6 +998,8 @@ struct TrackedPosition {
     tick_size: Option<Decimal>,
     /// Whether this is a neg_risk market
     neg_risk: Option<bool>,
+    /// PolyConsensus data: entry snapshot + current
+    consensus: Option<ConsensusData>,
 }
 
 impl TrackedPosition {
@@ -1046,6 +1256,7 @@ async fn run_position_scanner(
                             min_order_size: None,
                             tick_size: None,
                             neg_risk: None,
+                            consensus: None,
                         });
 
                         // Restore SL/TP from DB for new positions
@@ -1109,6 +1320,59 @@ async fn run_position_scanner(
                         }
                         Err(e) => {
                             log_error(&format!("Failed to fetch orderbook meta for {}.. : {}", &tid[..16.min(tid.len())], e));
+                        }
+                    }
+                }
+
+                // Fetch PolyConsensus data for active positions (every 60s, matching API cache)
+                let should_fetch_consensus = {
+                    let s = state.read().await;
+                    s.positions.first()
+                        .and_then(|p| p.consensus.as_ref())
+                        .map(|cd| cd.current.timestamp.elapsed() >= Duration::from_secs(55))
+                        .unwrap_or(true) // fetch if no consensus data yet
+                };
+                if should_fetch_consensus {
+                    let s = state.read().await;
+                    let positions_for_consensus: Vec<(String, String)> = s.positions.iter()
+                        .filter(|p| p.status == PositionStatus::Active && !p.condition_id.is_empty())
+                        .map(|p| (p.token_id.clone(), p.condition_id.clone()))
+                        .collect();
+                    drop(s);
+
+                    for (token_id, cond_id) in &positions_for_consensus {
+                        match fetch_consensus_data(cond_id).await {
+                            Ok(current_snap) => {
+                                let mut s = state.write().await;
+                                // Check if position already has consensus data
+                                let needs_init = s.positions.iter()
+                                    .find(|p| p.token_id == *token_id)
+                                    .map(|p| p.consensus.is_none())
+                                    .unwrap_or(false);
+
+                                if needs_init {
+                                    // First time — load entry from DB or use current as entry
+                                    let entry = s.db.load_consensus_entry(cond_id)
+                                        .unwrap_or_else(|| current_snap.clone());
+                                    s.db.save_consensus_entry(cond_id, &entry);
+                                    if let Some(pos) = s.positions.iter_mut().find(|p| p.token_id == *token_id) {
+                                        pos.consensus = Some(ConsensusData {
+                                            entry,
+                                            current: current_snap,
+                                        });
+                                    }
+                                } else {
+                                    // Update current snapshot only
+                                    if let Some(pos) = s.positions.iter_mut().find(|p| p.token_id == *token_id) {
+                                        if let Some(data) = &mut pos.consensus {
+                                            data.current = current_snap;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log_error(&format!("PolyConsensus fetch failed for {}.. : {}", &cond_id[..16.min(cond_id.len())], e));
+                            }
                         }
                     }
                 }
@@ -1553,8 +1817,9 @@ fn draw_ui(f: &mut Frame, state: &AppState) {
             Constraint::Length(2),  // Header
             Constraint::Length(1),  // Status bar
             Constraint::Min(8),    // Position table
+            Constraint::Length(7),  // Consensus detail panel
             Constraint::Length(1),  // Input bar
-            Constraint::Length(8),  // Logs
+            Constraint::Length(6),  // Logs
             Constraint::Length(1),  // Footer
         ])
         .split(f.area());
@@ -1617,7 +1882,7 @@ fn draw_ui(f: &mut Frame, state: &AppState) {
     // ========== POSITION TABLE ==========
     let header_cells = [
         "#", "Market", "Outcome", "Shares", "Entry", "Bid", "Ask", 
-        "SL", "TP", "PnL%", "Status",
+        "SL", "TP", "PnL%", "Vol$K", "Traders", "Status",
     ]
     .iter()
     .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
@@ -1668,6 +1933,29 @@ fn draw_ui(f: &mut Frame, state: &AppState) {
             let sl_color = if pos.sl_price.is_some() { Color::Red } else { Color::DarkGray };
             let tp_color = if pos.tp_price.is_some() { Color::Green } else { Color::DarkGray };
 
+            let (vol_str, vol_color, traders_str, traders_color) = if let Some(cd) = &pos.consensus {
+                let vol_pct = if cd.entry.total_value > 0.0 {
+                    (cd.current.total_value - cd.entry.total_value) / cd.entry.total_value * 100.0
+                } else { 0.0 };
+                let vol_color = if vol_pct > 0.0 { Color::Green } else if vol_pct < 0.0 { Color::Red } else { Color::Cyan };
+
+                let entry_traders = cd.entry.yes_count + cd.entry.no_count;
+                let current_traders = cd.current.yes_count + cd.current.no_count;
+                let traders_pct = if entry_traders > 0 {
+                    (current_traders - entry_traders) as f64 / entry_traders as f64 * 100.0
+                } else { 0.0 };
+                let traders_color = if traders_pct > 0.0 { Color::Green } else if traders_pct < 0.0 { Color::Red } else { Color::White };
+
+                (
+                    format!("${:.0}K{:+.0}%", cd.current.total_value / 1000.0, vol_pct),
+                    vol_color,
+                    format!("{}Y/{}N{:+.0}%", cd.current.yes_count, cd.current.no_count, traders_pct),
+                    traders_color,
+                )
+            } else {
+                ("--".to_string(), Color::DarkGray, "--".to_string(), Color::DarkGray)
+            };
+
             Row::new(vec![
                 Cell::from(format!("{}", i + 1)).style(base_style),
                 Cell::from(pos.short_title(28)).style(base_style),
@@ -1679,6 +1967,8 @@ fn draw_ui(f: &mut Frame, state: &AppState) {
                 Cell::from(sl_str).style(base_style.fg(sl_color)),
                 Cell::from(tp_str).style(base_style.fg(tp_color)),
                 Cell::from(pnl_str).style(base_style.fg(pnl_color)),
+                Cell::from(vol_str).style(base_style.fg(vol_color)),
+                Cell::from(traders_str).style(base_style.fg(traders_color)),
                 Cell::from(format!("{}", pos.status)).style(base_style.fg(status_color)),
             ])
         })
@@ -1697,7 +1987,9 @@ fn draw_ui(f: &mut Frame, state: &AppState) {
             Constraint::Length(8),   // SL
             Constraint::Length(8),   // TP
             Constraint::Length(8),   // PnL%
-            Constraint::Length(14),  // Status
+            Constraint::Length(12),  // Vol$K
+            Constraint::Length(12),  // Traders
+            Constraint::Length(8),   // Status
         ],
     )
     .header(header_row)
@@ -1714,6 +2006,104 @@ fn draw_ui(f: &mut Frame, state: &AppState) {
     // Clone the table state for rendering.
     let mut table_state = state.table_state.clone();
     f.render_stateful_widget(table, main_chunks[2], &mut table_state);
+
+    // ========== CONSENSUS DETAIL PANEL ==========
+    let consensus_content = if let Some(pos) = state.selected_position() {
+        if let Some(cd) = &pos.consensus {
+            let price_delta = if pos.entry_price > Decimal::ZERO {
+                let bid = pos.current_bid.unwrap_or(pos.entry_price);
+                let pct = ((bid - pos.entry_price) / pos.entry_price * dec!(100))
+                    .to_f64().unwrap_or(0.0);
+                format!("{:+.1}%", pct)
+            } else {
+                "--".to_string()
+            };
+            let cons_delta = cd.current.consensus_pct - cd.entry.consensus_pct;
+            let cons_arrow = if cons_delta > 0 { "\u{2191}" } else if cons_delta < 0 { "\u{2193}" } else { "=" };
+            let vol_delta = cd.current.total_value - cd.entry.total_value;
+            vec![
+                Line::from(vec![
+                    Span::styled(" Price:     ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("Entry {:.1}\u{00a2}", pos.entry_price * dec!(100)), Style::default().fg(Color::White)),
+                    Span::raw(" \u{2192} "),
+                    Span::styled(
+                        format!("Now {:.1}\u{00a2}", pos.current_bid.unwrap_or(pos.entry_price) * dec!(100)),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(format!(" ({})", price_delta), Style::default().fg(
+                        if price_delta.starts_with('+') { Color::Green } else if price_delta.starts_with('-') { Color::Red } else { Color::DarkGray }
+                    )),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Consensus: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("Entry {}Y/{}N ({}%)", cd.entry.yes_count, cd.entry.no_count, cd.entry.consensus_pct),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::raw(" \u{2192} "),
+                    Span::styled(
+                        format!("Now {}Y/{}N ({}%)", cd.current.yes_count, cd.current.no_count, cd.current.consensus_pct),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!(" [{}{:+}%]", cons_arrow, cons_delta),
+                        Style::default().fg(if cons_delta > 0 { Color::Green } else if cons_delta < 0 { Color::Red } else { Color::DarkGray }),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Volume:    ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("Entry ${:.0}K", cd.entry.total_value / 1000.0), Style::default().fg(Color::White)),
+                    Span::raw(" \u{2192} "),
+                    Span::styled(format!("Now ${:.0}K", cd.current.total_value / 1000.0), Style::default().fg(Color::Cyan)),
+                    Span::styled(format!(" ({:+.0})", vol_delta), Style::default().fg(
+                        if vol_delta > 0.0 { Color::Green } else if vol_delta < 0.0 { Color::Red } else { Color::DarkGray }
+                    )),
+                ]),
+                Line::from(vec![
+                    Span::styled(" ML Signal: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        cd.current.ml_signal.clone(),
+                        Style::default().fg(
+                            if cd.current.ml_signal.contains("BUY") { Color::Green }
+                            else if cd.current.ml_signal.contains("SELL") { Color::Red }
+                            else { Color::Yellow }
+                        ).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" (edge {:+.1}%, confidence: {}, risk: {:.1})",
+                            cd.current.ml_edge * 100.0, cd.current.ml_confidence, cd.current.ml_risk),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(" Traders:   ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} smart money wallets ({} active)",
+                            cd.current.top_trader_count, cd.current.active_trader_count),
+                        Style::default().fg(Color::White),
+                    ),
+                ]),
+            ]
+        } else {
+            vec![Line::from(Span::styled(
+                " Loading PolyConsensus data...",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        }
+    } else {
+        vec![Line::from(Span::styled(
+            " Select a position to see consensus data",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    };
+
+    let consensus_panel = Paragraph::new(consensus_content).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" PolyConsensus ")
+            .border_style(Style::default().fg(Color::Magenta)),
+    );
+    f.render_widget(consensus_panel, main_chunks[3]);
 
     // ========== INPUT BAR ==========
     let input_line = match &state.input_mode {
@@ -1756,7 +2146,7 @@ fn draw_ui(f: &mut Frame, state: &AppState) {
         }
     };
     let input_bar = Paragraph::new(input_line);
-    f.render_widget(input_bar, main_chunks[3]);
+    f.render_widget(input_bar, main_chunks[4]);
 
     // ========== LOGS ==========
     let log_lines: Vec<Line> = state
@@ -1785,7 +2175,7 @@ fn draw_ui(f: &mut Frame, state: &AppState) {
             .title(" Logs ")
             .border_style(Style::default().fg(Color::DarkGray)),
     );
-    f.render_widget(logs_widget, main_chunks[4]);
+    f.render_widget(logs_widget, main_chunks[5]);
 
     // ========== FOOTER ==========
     let footer = Paragraph::new(Line::from(vec![
@@ -1806,7 +2196,7 @@ fn draw_ui(f: &mut Frame, state: &AppState) {
         Span::styled("r", Style::default().fg(Color::Yellow)),
         Span::raw(":Refresh "),
     ]));
-    f.render_widget(footer, main_chunks[5]);
+    f.render_widget(footer, main_chunks[6]);
 }
 
 // ============================================================================
@@ -1912,6 +2302,7 @@ async fn main() -> Result<()> {
             min_order_size: None,
             tick_size: None,
             neg_risk: None,
+            consensus: None,
         });
     }
 
