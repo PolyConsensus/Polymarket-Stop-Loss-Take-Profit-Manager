@@ -1000,6 +1000,10 @@ struct TrackedPosition {
     neg_risk: Option<bool>,
     /// PolyConsensus data: entry snapshot + current
     consensus: Option<ConsensusData>,
+    /// Consecutive checks bid was below SL (anti-manipulation)
+    sl_trigger_count: u32,
+    /// Consecutive checks bid was above TP (anti-manipulation)
+    tp_trigger_count: u32,
 }
 
 impl TrackedPosition {
@@ -1220,10 +1224,18 @@ async fn run_position_scanner(
                         if updated.current_bid.is_none() && cur_price > Decimal::ZERO {
                             updated.current_bid = Some(cur_price);
                         }
-                        // Don't reactivate Sold/Triggered positions — they were intentionally stopped
-                        // Only reactivate Error positions (those may be transient failures)
-                        if matches!(updated.status, PositionStatus::Error(_)) && size > Decimal::ZERO {
+                        // Reactivate positions on re-entry (user bought back after SL/TP sell)
+                        if size > Decimal::ZERO && matches!(updated.status, 
+                            PositionStatus::Sold | PositionStatus::SLTriggered | PositionStatus::TPTriggered | PositionStatus::Error(_)) 
+                        {
+                            let old_status = format!("{:?}", updated.status);
                             updated.status = PositionStatus::Active;
+                            updated.exit_pnl = None;
+                            updated.current_bid = if cur_price > Decimal::ZERO { Some(cur_price) } else { None };
+                            updated.current_ask = None;
+                            updated.sl_price = None;
+                            updated.tp_price = None;
+                            s.add_log(format!("[OK] Re-entry detected: {} — reactivated from {}", updated.market_title, old_status));
                         }
                         new_positions.push(updated);
                     } else {
@@ -1257,6 +1269,8 @@ async fn run_position_scanner(
                             tick_size: None,
                             neg_risk: None,
                             consensus: None,
+                            sl_trigger_count: 0,
+                            tp_trigger_count: 0,
                         });
 
                         // Restore SL/TP from DB for new positions
@@ -1599,6 +1613,8 @@ async fn run_sltp_checker(
 
         // Collect positions that need action
         // Tuple: (idx, token_id, market_title, outcome, status_str, shares, entry_price, bid_price, is_tp)
+        let mut sl_increments: Vec<(usize, bool)> = Vec::new();
+        let mut tp_increments: Vec<(usize, bool)> = Vec::new();
         let triggers: Vec<(usize, String, String, String, String, Decimal, Decimal, Decimal, bool)> = {
             let s = state.read().await;
             let mut result = Vec::new();
@@ -1613,24 +1629,108 @@ async fn run_sltp_checker(
                     None => continue,
                 };
 
+                // Anti-manipulation: require CONFIRMATIONS_REQUIRED consecutive checks
+                // Check interval is 250ms, so 12 checks = 3 seconds of sustained price
+                const CONFIRMATIONS_REQUIRED: u32 = 12;
+
                 // Check SL: sell when bid <= sl_price
                 if let Some(sl) = pos.sl_price {
                     if bid <= sl {
-                        result.push((i, pos.token_id.clone(), pos.market_title.clone(), pos.outcome.clone(), format!("{}", pos.status), pos.shares, pos.entry_price, bid, false));
-                        continue; // Don't check TP if SL triggers
+                        // Will increment counter after this read lock is released
+                        let count = pos.sl_trigger_count + 1;
+                        if count >= CONFIRMATIONS_REQUIRED {
+                            result.push((i, pos.token_id.clone(), pos.market_title.clone(), pos.outcome.clone(), format!("{}", pos.status), pos.shares, pos.entry_price, bid, false));
+                            continue;
+                        }
+                        // Not confirmed yet — will increment below
+                        sl_increments.push((i, true));
+                        continue; // Don't check TP while SL is pending
                     }
                 }
 
                 // Check TP: sell when bid >= tp_price
                 if let Some(tp) = pos.tp_price {
                     if bid >= tp {
-                        result.push((i, pos.token_id.clone(), pos.market_title.clone(), pos.outcome.clone(), format!("{}", pos.status), pos.shares, pos.entry_price, bid, true));
+                        let count = pos.tp_trigger_count + 1;
+                        if count >= CONFIRMATIONS_REQUIRED {
+                            result.push((i, pos.token_id.clone(), pos.market_title.clone(), pos.outcome.clone(), format!("{}", pos.status), pos.shares, pos.entry_price, bid, true));
+                            continue;
+                        }
+                        tp_increments.push((i, true));
+                        continue;
                     }
                 }
             }
 
             result
         };
+
+        // Update confirmation counters (requires write lock)
+        if !sl_increments.is_empty() || !tp_increments.is_empty() || !triggers.is_empty() {
+            let mut s = state.write().await;
+            let mut counter_logs: Vec<String> = Vec::new();
+            // Increment counters for positions approaching trigger
+            for (idx, _) in &sl_increments {
+                if let Some(pos) = s.positions.get_mut(*idx) {
+                    pos.sl_trigger_count += 1;
+                    if pos.sl_trigger_count == 1 {
+                        let title = pos.short_title(25);
+                        let bid = pos.current_bid.unwrap_or_default();
+                        counter_logs.push(format!(
+                            "[!] SL breach detected for {} @ bid={:.2}¢ — confirming...",
+                            title, bid * dec!(100)
+                        ));
+                    }
+                }
+            }
+            for (idx, _) in &tp_increments {
+                if let Some(pos) = s.positions.get_mut(*idx) {
+                    pos.tp_trigger_count += 1;
+                    if pos.tp_trigger_count == 1 {
+                        let title = pos.short_title(25);
+                        let bid = pos.current_bid.unwrap_or_default();
+                        counter_logs.push(format!(
+                            "[!] TP breach detected for {} @ bid={:.2}¢ — confirming...",
+                            title, bid * dec!(100)
+                        ));
+                    }
+                }
+            }
+            // Reset counters for confirmed triggers (they'll be processed below)
+            for (idx, ..) in &triggers {
+                if let Some(pos) = s.positions.get_mut(*idx) {
+                    pos.sl_trigger_count = 0;
+                    pos.tp_trigger_count = 0;
+                }
+            }
+            // Reset counters for positions where price recovered (not in any increment/trigger list)
+            let triggered_indices: Vec<usize> = sl_increments.iter().map(|(i,_)| *i)
+                .chain(tp_increments.iter().map(|(i,_)| *i))
+                .chain(triggers.iter().map(|(i,..)| *i))
+                .collect();
+            let mut recovered_logs: Vec<String> = Vec::new();
+            for (i, pos) in s.positions.iter_mut().enumerate() {
+                if !triggered_indices.contains(&i) {
+                    if pos.sl_trigger_count > 0 {
+                        let title = pos.short_title(25);
+                        recovered_logs.push(format!(
+                            "[OK] SL spike filtered for {} — price recovered after {} checks",
+                            title, pos.sl_trigger_count
+                        ));
+                        pos.sl_trigger_count = 0;
+                    }
+                    if pos.tp_trigger_count > 0 {
+                        pos.tp_trigger_count = 0;
+                    }
+                }
+            }
+            for log in recovered_logs {
+                s.add_log(log);
+            }
+            for log in counter_logs {
+                s.add_log(log);
+            }
+        }
 
         // Process triggers
         for (idx, token_id, market_title, outcome, _status_str, shares, entry_price, bid_price, is_tp) in triggers {
@@ -2303,6 +2403,8 @@ async fn main() -> Result<()> {
             tick_size: None,
             neg_risk: None,
             consensus: None,
+            sl_trigger_count: 0,
+            tp_trigger_count: 0,
         });
     }
 
